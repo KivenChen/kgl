@@ -36,6 +36,7 @@ from sglang.srt.configs import (
     DeepseekVL2Config,
     ExaoneConfig,
     MultiModalityConfig,
+    PixtralConfig,
 )
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.utils import is_remote_url
@@ -46,6 +47,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     ExaoneConfig.model_type: ExaoneConfig,
     DeepseekVL2Config.model_type: DeepseekVL2Config,
     MultiModalityConfig.model_type: MultiModalityConfig,
+    PixtralConfig.model_type: PixtralConfig,
 }
 
 for name, cls in _CONFIG_REGISTRY.items():
@@ -75,6 +77,8 @@ def get_config(
     config = AutoConfig.from_pretrained(
         model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
     )
+
+    print("python.sglang.srt.hf_transformers_utils: config: ", config)
 
     # FIXME: Pour contents of janus-pro's langauge_config to first-level
     if isinstance(model, str) and model.lower().startswith("deepseek-ai/janus-pro"):

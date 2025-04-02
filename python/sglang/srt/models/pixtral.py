@@ -22,9 +22,11 @@ from typing import Iterable, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoConfig, PixtralVisionConfig
+from transformers import AutoConfig
 from transformers.activations import ACT2FN
 from transformers.models.pixtral.image_processing_pixtral import _num_image_tokens
+
+from sglang.srt.configs.pixtral import PixtralConfig, PixtralVisionEncoderConfig
 
 from sglang.srt.hf_transformers_utils import get_processor
 from sglang.srt.layers.layernorm import RMSNorm
@@ -54,23 +56,8 @@ PATCH_MERGE = "patch_merge"
 
 
 # Types and Utility Functions
-@dataclass
-class VisionEncoderArgs:
-    """Args for the vision encoder part of Pixtral."""
-    hidden_size: int
-    num_channels: int
-    image_size: int
-    patch_size: int
-    intermediate_size: int
-    num_hidden_layers: int
-    num_attention_heads: int
-    rope_theta: float  # for rope-2D
-    image_token_id: int
-    adapter_bias: bool = True
-    spatial_merge_size: int = 1
-    add_pre_mm_projector_layer_norm: bool = False
-    mm_projector_id: str = ""
-
+# We'll use PixtralVisionEncoderConfig instead of a separate dataclass
+    
 
 def precompute_freqs_cis_2d(
     dim: int,
@@ -158,7 +145,7 @@ def apply_rotary_emb_vit(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Te
 
 
 class FeedForward(nn.Module):
-    def __init__(self, args: VisionEncoderArgs, act_type: str = "silu"):
+    def __init__(self, args: PixtralVisionEncoderConfig, act_type: str = "silu"):
         super().__init__()
         self.act_type = act_type
         self.act_fn = ACT2FN(act_type)
@@ -196,7 +183,7 @@ class FeedForward(nn.Module):
 class TransformerBlock(nn.Module):
     """Transformer block with attention and feed-forward layers."""
     
-    def __init__(self, args: VisionEncoderArgs):
+    def __init__(self, args: PixtralVisionEncoderConfig):
         super().__init__()
         self.attention = VisionAttention(
             embed_dim=args.hidden_size,
@@ -226,7 +213,7 @@ class TransformerBlock(nn.Module):
 class Transformer(nn.Module):
     """Stack of transformer blocks for vision processing."""
     
-    def __init__(self, args: VisionEncoderArgs):
+    def __init__(self, args: PixtralVisionEncoderConfig):
         super().__init__()
         self.layers = nn.ModuleList()
         for _ in range(args.num_hidden_layers):
@@ -253,7 +240,7 @@ def position_meshgrid(patch_embeds_list: List[torch.Tensor]):
 class VisionTransformer(nn.Module):
     """Vision transformer for processing image inputs."""
     
-    def __init__(self, args: VisionEncoderArgs):
+    def __init__(self, args: PixtralVisionEncoderConfig):
         super().__init__()
         self.args = args
         self.patch_conv = nn.Conv2d(
@@ -464,9 +451,9 @@ class PatchMerger(nn.Module):
 class VisionLanguageAdapter(nn.Module):
     """Adapter to connect vision and language models."""
     
-    def __init__(self, args: VisionEncoderArgs, dim: int, quant_config=None, prefix=""):
+    def __init__(self, args: PixtralVisionEncoderConfig, dim: int, quant_config=None, prefix=""):
         super().__init__()
-        assert isinstance(args, VisionEncoderArgs)
+        assert isinstance(args, PixtralVisionEncoderConfig)
         
         # Using ColumnParallelLinear for w_in as it might expand dimensions
         self.w_in = ColumnParallelLinear(
@@ -498,7 +485,7 @@ class VisionLanguageAdapter(nn.Module):
 class PixtralProcessorAdapter:
     """Adapter for Pixtral's image processor."""
     
-    def __init__(self, vision_encoder_args: VisionEncoderArgs, processor=None):
+    def __init__(self, vision_encoder_args: PixtralVisionEncoderConfig, processor=None):
         self.vision_encoder_args = vision_encoder_args
         self.processor = processor
         
@@ -536,7 +523,7 @@ class PixtralProcessingInfo:
 class PixtralMultiModalProcessor:
     """Processor for handling multimodal inputs in Pixtral."""
     
-    def __init__(self, config, vision_encoder_args: VisionEncoderArgs):
+    def __init__(self, config, vision_encoder_args: PixtralVisionEncoderConfig):
         self.vision_encoder_args = vision_encoder_args
         self.processor_adapter = PixtralProcessorAdapter(vision_encoder_args)
         self.mm_processing_info = PixtralProcessingInfo(config)
@@ -674,7 +661,12 @@ class PixtralForConditionalGeneration:
             prefix=add_prefix(prefix, "language_model")
         )
         
-        self._init_vision_encoder()
+        # Use config class if available
+        if hasattr(self.config, 'vision_encoder') and isinstance(self.config.vision_encoder, dict):
+            # Convert dict to PixtralVisionEncoderConfig
+            self.vision_encoder_args = PixtralVisionEncoderConfig(**self.config.vision_encoder)
+        else:
+            self._init_vision_encoder()
         
         # Initialize multimodal processor
         self.mm_process = PixtralMultiModalProcessor(
@@ -724,7 +716,7 @@ class PixtralForConditionalGeneration:
         )
         
         # Configure vision encoder parameters
-        self.vision_encoder_args = VisionEncoderArgs(
+        self.vision_encoder_args = PixtralVisionEncoderConfig(
             hidden_size=vision_width,
             num_channels=3,
             image_size=image_size,
