@@ -17,6 +17,7 @@ import contextlib
 import os
 import warnings
 from pathlib import Path
+import json
 from typing import Dict, Optional, Type, Union
 
 from huggingface_hub import snapshot_download
@@ -36,9 +37,11 @@ from sglang.srt.configs import (
     DeepseekVL2Config,
     ExaoneConfig,
     MultiModalityConfig,
+    PixtralConfig,
 )
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.utils import is_remote_url
+from sglang.srt.configs.mistral import is_mistralai_model
 
 _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     ChatGLMConfig.model_type: ChatGLMConfig,
@@ -46,6 +49,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     ExaoneConfig.model_type: ExaoneConfig,
     DeepseekVL2Config.model_type: DeepseekVL2Config,
     MultiModalityConfig.model_type: MultiModalityConfig,
+    # PixtralConfig.model_type: PixtralConfig,
 }
 
 for name, cls in _CONFIG_REGISTRY.items():
@@ -53,7 +57,14 @@ for name, cls in _CONFIG_REGISTRY.items():
         AutoConfig.register(name, cls)
 
 
-def download_from_hf(model_path: str):
+def download_from_hf(model_path: str) -> str:
+    """
+    Download model files from Huggingface.
+    Args:
+        model_path (str): The name or path of model.
+    Returns:
+        str: Folder path to the downloaded model.
+    """
     if os.path.exists(model_path):
         return model_path
 
@@ -71,10 +82,13 @@ def get_config(
     if is_gguf:
         kwargs["gguf_file"] = model
         model = Path(model).parent
-
+    print("sglang.srt.hf_transformers_utils.get_config(): model =", model)
+    
     config = AutoConfig.from_pretrained(
         model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
     )
+
+    print("sglang.srt.hf_transformers_utils.get_config(): autoconfig() -> config =", config)
 
     # FIXME: Pour contents of janus-pro's langauge_config to first-level
     if isinstance(model, str) and model.lower().startswith("deepseek-ai/janus-pro"):
@@ -82,6 +96,9 @@ def get_config(
         for key, val in config.language_config.__dict__.items():
             setattr(config, key, val)
         setattr(config, "architectures", ["MultiModalityCausalLM"])
+    
+    if isinstance(model, str) and is_mistralai_model(model):
+        config = load_mistral_config(model, revision)
 
     if config.model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[config.model_type]
@@ -90,6 +107,8 @@ def get_config(
         setattr(config, "_name_or_path", model)
     if model_override_args:
         config.update(model_override_args)
+    
+    
 
     # Special architecture mapping check for GGUF models
     if is_gguf:
@@ -97,7 +116,7 @@ def get_config(
             raise RuntimeError(f"Can't get gguf config for {config.model_type}.")
         model_type = MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type]
         config.update({"architectures": [model_type]})
-
+    print("sglang.srt.hf_transformers_utils.get_config(): config =", config)
     return config
 
 
@@ -227,6 +246,8 @@ def get_processor(
         **kwargs,
     )
 
+    print("sglang.srt.hf_transformers_utils.get_processor(): config =", config)
+
     # fix: for Qwen2-VL model, inject default 'size' if not provided.
     if config.model_type in {"qwen2_vl"}:
         if "size" not in kwargs:
@@ -239,7 +260,7 @@ def get_processor(
         revision=revision,
         **kwargs,
     )
-
+    print("sglang.srt.hf_transformers_utils.get_processor(): processor =", processor)
     attach_additional_stop_token_ids(processor.tokenizer)
     return processor
 
@@ -265,3 +286,85 @@ def check_gguf_file(model: Union[str, os.PathLike]) -> bool:
     with open(model, "rb") as f:
         header = f.read(4)
     return header == b"GGUF"
+
+def replace_key(dict_: dict, mapping: Dict[str, str]):
+    new_dict = {}
+    for key, value in dict_.items():
+        new_key = mapping.get(key, key)
+        if isinstance(value, dict):
+            new_dict[new_key] = replace_key(value, mapping)
+        else:
+            new_dict[new_key] = value
+    return new_dict
+
+
+def fill_default(dict_: dict, mapping: Dict[str, str]):
+    for key, value in mapping.items():
+        if key not in dict_:
+            dict_[key] = value
+    return dict_
+
+def config_ify(dict_: dict, cls=PretrainedConfig):
+    for key, value in dict_.items():
+        if isinstance(value, dict):
+            dict_[key] = config_ify(value)
+    return cls(**dict_)
+
+
+def load_mistral_config(model, revision, config_file_name="params.json", cls=PretrainedConfig) -> PretrainedConfig:
+    # This function loads a params.json config which
+    # should be used when loading models in mistral format
+    config_path = Path(model) / config_file_name
+    if not config_path.is_file():
+        config_path = Path(download_from_hf(model)) / config_file_name
+    
+    with open(config_path, "r") as file:
+        config_dict = json.load(file)
+
+    rename_mistral_to_hf = {
+        "dim": "hidden_size",
+        "norm_eps": "rms_norm_eps",
+        "n_kv_heads": "num_key_value_heads",
+        "n_layers": "num_hidden_layers",
+        "n_heads": "num_attention_heads",
+        "intermediate_size": "hidden_dim",
+        "tie_embeddings": "tie_word_embeddings",
+        "activation": "hidden_act",
+        "vision_encoder": "vision_config",
+    }
+
+    hf_default_mapping = {
+        "model_type": "transformer",
+        "hidden_act": "silu",
+        "tie_word_embeddings": False,
+        "max_seq_len": 128_000,
+    }
+
+    config_dict = replace_key(config_dict, rename_mistral_to_hf)
+    config_dict = fill_default(config_dict, hf_default_mapping)
+
+    cls = PretrainedConfig
+    if "moe" in config_dict:
+        config_dict["architectures"] = ["MixtralForCausalLM"]
+        from transformers.models.mixtral import MixtralConfig
+        cls = MixtralConfig
+    else:
+        config_dict["architectures"] = ["MistralForCausalLM"]
+        from transformers.models.mistral import MistralConfig
+        cls = MistralConfig
+
+    if "vision_config" in config_dict:
+        vision_config = config_dict.pop("vision_config")
+        text_config = config_dict
+        from transformers.models.pixtral import PixtralVisionConfig
+        from transformers.models.mistral import MistralConfig
+        
+        config_dict = {
+            "text_config": MistralConfig(**text_config),
+            "vision_config": PixtralVisionConfig(**vision_config)
+        }
+        config_dict["architectures"] = ["PixtralForConditionalGeneration"]
+        config_dict["model_type"] = "pixtral"
+        cls = PixtralConfig
+    
+    return config_ify(config_dict, cls)

@@ -64,6 +64,7 @@ class ModelConfig:
             model_override_args=self.model_override_args,
             **kwargs,
         )
+        print("sglang.srt.models.model_config.ModelConfig.__init__(): hf_config =", self.hf_config)
         self.hf_text_config = get_hf_text_config(self.hf_config)
 
         # Check model type
@@ -477,6 +478,7 @@ multimodal_model_archs = [
     "Qwen2VLForConditionalGeneration",
     "Qwen2_5_VLForConditionalGeneration",
     "CLIPModel",
+    "PixtralForConditionalGeneration",
 ]
 
 

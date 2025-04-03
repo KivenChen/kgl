@@ -411,7 +411,7 @@ class ServerArgs:
             "--tokenizer-mode",
             type=str,
             default=ServerArgs.tokenizer_mode,
-            choices=["auto", "slow"],
+            choices=["auto", "slow", "mistral"],
             help="Tokenizer mode. 'auto' will use the fast "
             "tokenizer if available, and 'slow' will "
             "always use the slow tokenizer.",
@@ -431,6 +431,7 @@ class ServerArgs:
                 "safetensors",
                 "npcache",
                 "dummy",
+                "mistral",
                 "sharded_state",
                 "gguf",
                 "bitsandbytes",
@@ -447,6 +448,7 @@ class ServerArgs:
             "a numpy cache to speed up the loading. "
             '"dummy" will initialize the weights with random values, '
             "which is mainly for profiling."
+            '"mistral" will load the weights in the mistral format. '
             '"gguf" will load the weights in the gguf format. '
             '"bitsandbytes" will load the weights using bitsandbytes '
             "quantization."
