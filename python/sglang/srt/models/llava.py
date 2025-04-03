@@ -43,6 +43,7 @@ from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.srt.models.mistral import MistralForCausalLM
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.srt.utils import add_prefix, flatten_nested_list
+from transformers.utils.dummy_pt_objects import PixtralVisionModel
 
 
 class LlavaBaseForCausalLM(nn.Module):
@@ -562,9 +563,11 @@ class LlavaMistralForCausalLM(LlavaBaseForCausalLM):
             self.config.vision_config = CLIPVisionConfig(self.config.mm_vision_tower)
         if getattr(self.config, "text_config", None) is None:
             self.config.text_config = MistralConfig(self.config._name_or_path)
-
-        self.config.vision_config.hidden_size = config.mm_hidden_size
-        self.config.text_config.hidden_size = config.hidden_size
+        
+        if not hasattr(self.config.vision_config, "hidden_size"):
+            self.config.vision_config.hidden_size = config.mm_hidden_size
+        if not hasattr(self.config.text_config, "hidden_size"):
+            self.config.text_config.hidden_size = config.hidden_size
 
         if getattr(self.config, "projector_hidden_act", None) is None:
             self.config.projector_hidden_act = "gelu"
@@ -582,5 +585,100 @@ class LlavaMistralForCausalLM(LlavaBaseForCausalLM):
                 torch.empty(config.text_config.hidden_size, dtype=torch.float16)
             )
 
+class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
+    model_cls = {
+        "mistral": MistralForCausalLM,
+        "qwen": Qwen2ForCausalLM,
+        "llama": LlamaForCausalLM,
+        "pixtral": PixtralVisionModel,
+    }
 
-EntryClass = [LlavaLlamaForCausalLM, LlavaQwenForCausalLM, LlavaMistralForCausalLM]
+    config_cls = {
+        "mistral": MistralConfig,
+        "qwen": Qwen2Config,
+        "llama": LlavaConfig,
+        # "pixtral": PixtralVisionConfig,
+    }
+    
+    def __init__(
+        self,
+        config: LlavaConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+
+        assert hasattr(config, "text_config")
+        assert hasattr(config, "vision_config")
+        self.config = config
+
+        self.multi_modal_projector = LlavaMultiModalProjector(config)
+        self.language_model = self.model_cls[config.text_config.model_type](
+            config.text_config,
+            quant_config=quant_config,
+            prefix=add_prefix("language_model", prefix),
+        )
+        self.vision_tower = self.model_cls[config.vision_config.model_type](
+            config.vision_config,
+            # quant_config=quant_config,
+            # prefix=add_prefix("vision_tower", prefix),
+        )
+        if "unpad" in getattr(config, "mm_patch_merge_type", ""):
+            self.language_model.model.image_newline = nn.Parameter(
+                torch.empty(config.text_config.hidden_size, dtype=torch.float16)
+            )
+            
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        """Load weights for LlavaForConditionalGeneration.
+        
+        Unlike the base class implementation, this one doesn't need to handle
+        weight name remapping as the weights are already properly structured with
+        'language_model' and 'vision_tower' prefixes in the safetensors files.
+        """
+        # Set configuration properties needed by the base class
+        self.vision_feature_layer = self.config.vision_feature_layer
+        self.vision_feature_select_strategy = self.config.vision_feature_select_strategy
+        self.image_size = self.config.vision_config.image_size
+        self.patch_size = self.config.vision_config.patch_size
+        
+        self.mm_patch_merge_type = getattr(self.config, "mm_patch_merge_type", "flat")
+        self.image_aspect_ratio = getattr(self.config, "image_aspect_ratio", "square")
+        self.image_grid_pinpoints = getattr(self.config, "image_grid_pinpoints", None)
+
+        self.image_feature_len = int((self.image_size // self.patch_size) ** 2)
+        if (
+            self.vision_feature_select_strategy == "patch"
+            or self.vision_feature_select_strategy == "full"
+        ):
+            pass
+        elif self.vision_feature_select_strategy == "cls_patch":
+            self.image_feature_len += 1
+        else:
+            raise ValueError(f"Unexpected select feature: {self.vision_feature_select_strategy}")
+            
+        # Create dictionaries for direct parameter loading
+        params_dict = dict(self.named_parameters())
+        vision_params = {}
+        language_params = {}
+        projector_params = {}
+        other_params = {}
+        
+        # Organize parameters into their respective components
+        for name, param in params_dict.items():
+            if name.startswith("vision_tower"):
+                vision_params[name] = param
+            elif name.startswith("language_model"):
+                language_params[name] = param
+            elif name.startswith("multi_modal_projector"):
+                projector_params[name] = param
+            else:
+                other_params[name] = param
+        
+        # Load weights directly without remapping
+        for name, loaded_weight in weights:
+            if name in params_dict:
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+
+EntryClass = [LlavaLlamaForCausalLM, LlavaQwenForCausalLM, LlavaMistralForCausalLM, LlavaForConditionalGeneration]
